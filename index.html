@@ -1,0 +1,260 @@
+import torch
+import numpy as np
+from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from IPython.display import HTML, display
+import time
+import os
+import sys
+import subprocess
+from pathlib import Path
+import hashlib
+
+# Check for required packages
+try:
+    import torch
+    from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+except ImportError:
+    print("Installing required packages...")
+    subprocess.run([sys.executable, "-m", "pip", "install", "torch", "diffusers", "transformers", "accelerate"])
+    import torch
+    from diffusers import StableDiffusionPipeline, StableDiffusionImg2ImgPipeline
+
+# Set up device (use GPU if available)
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"Using device: {device}")
+
+# Initialize models
+def load_models():
+    """Load all required AI models locally"""
+    print("Loading models... (this may take several minutes)")
+    
+    # Text-to-image model for character creation
+    txt2img_pipe = StableDiffusionPipeline.from_pretrained(
+        "stabilityai/stable-diffusion-2-1", 
+        torch_dtype=torch.float16 if device == "cuda" else torch.float32
+    ).to(device)
+    
+    # Image-to-image model for consistent character generation
+    img2img_pipe = StableDiffusionImg2ImgPipeline(
+        vae=txt2img_pipe.vae,
+        text_encoder=txt2img_pipe.text_encoder,
+        tokenizer=txt2img_pipe.tokenizer,
+        unet=txt2img_pipe.unet,
+        scheduler=txt2img_pipe.scheduler,
+        safety_checker=txt2img_pipe.safety_checker,
+        feature_extractor=txt2img_pipe.feature_extractor,
+    ).to(device)
+    
+    print("Models loaded successfully!")
+    return txt2img_pipe, img2img_pipe
+
+# Character consistency system
+class CharacterGenerator:
+    def __init__(self, models, character_prompt):
+        self.txt2img, self.img2img = models
+        self.character_prompt = character_prompt
+        self.base_image = None
+        self.seed = 42
+        self.style = "pixar animation style, 4k, detailed, cinematic lighting"
+        
+        # Create character base image
+        self.create_base_character()
+    
+    def create_base_character(self):
+        """Generate the base character image"""
+        print("Creating base character...")
+        generator = torch.Generator(device=device).manual_seed(self.seed)
+        
+        self.base_image = self.txt2img(
+            prompt=f"{self.character_prompt}, {self.style}",
+            generator=generator,
+            num_inference_steps=25,
+            guidance_scale=7.5
+        ).images[0]
+        
+        # Save base character
+        self.base_image.save("base_character.png")
+        print("Base character created!")
+    
+    def generate_consistent_frame(self, action_prompt, strength=0.6):
+        """Generate new frame with consistent character"""
+        generator = torch.Generator(device=device).manual_seed(self.seed)
+        
+        prompt = f"{action_prompt}, {self.character_prompt}, {self.style}"
+        
+        return self.img2img(
+            prompt=prompt,
+            image=self.base_image,
+            strength=strength,
+            generator=generator,
+            num_inference_steps=25,
+            guidance_scale=7.5
+        ).images[0]
+
+# Video creation system
+class VideoCreator:
+    def __init__(self, character_generator, script, fps=12):
+        self.char_gen = character_generator
+        self.script = script
+        self.fps = fps
+        self.frames = []
+        self.audio_chunks = []
+        
+    def generate_scene(self, action_prompt, duration_sec):
+        """Generate a scene with consistent character"""
+        print(f"Generating {duration_sec}s scene: {action_prompt}")
+        num_frames = int(duration_sec * self.fps)
+        
+        for i in range(num_frames):
+            # Gradually increase variation through the scene
+            strength = 0.5 + (0.3 * i / num_frames)
+            frame = self.char_gen.generate_consistent_frame(action_prompt, strength)
+            self.frames.append(frame)
+            
+            # Show progress
+            if (i+1) % 5 == 0:
+                print(f"  Frame {i+1}/{num_frames} generated")
+    
+    def generate_video(self, output_file="output.mp4"):
+        """Create video from generated frames"""
+        print("Creating video...")
+        
+        # Create temporary directory for frames
+        os.makedirs("frames", exist_ok=True)
+        frame_paths = []
+        
+        # Save all frames
+        for i, frame in enumerate(self.frames):
+            path = f"frames/frame_{i:04d}.png"
+            frame.save(path)
+            frame_paths.append(path)
+        
+        # Create video using ffmpeg (must be installed)
+        try:
+            cmd = [
+                "ffmpeg", "-y", 
+                "-framerate", str(self.fps),
+                "-i", "frames/frame_%04d.png",
+                "-c:v", "libx264",
+                "-pix_fmt", "yuv420p",
+                "-crf", "23",
+                output_file
+            ]
+            subprocess.run(cmd, check=True)
+            print(f"Video created: {output_file}")
+            return output_file
+        except Exception as e:
+            print(f"Video creation failed: {str(e)}")
+            return None
+    
+    def preview_scenes(self):
+        """Show preview of key scenes"""
+        fig, axes = plt.subplots(1, min(5, len(self.script)), figsize=(20, 5))
+        
+        for i, (scene, _) in enumerate(self.script[:5]):
+            # Generate preview frame for scene
+            frame = self.char_gen.generate_consistent_frame(scene)
+            
+            if len(self.script) > 1:
+                ax = axes[i]
+            else:
+                ax = axes
+                
+            ax.imshow(frame)
+            ax.set_title(f"Scene {i+1}\n{scene[:50]}...", fontsize=10)
+            ax.axis('off')
+        
+        plt.tight_layout()
+        plt.show()
+
+# Text-to-Speech (using built-in OS capabilities)
+class TextToSpeech:
+    def __init__(self):
+        self.supported_platforms = ["darwin", "win32", "linux"]
+    
+    def speak(self, text, output_file="voiceover.wav"):
+        """Generate speech using system tools"""
+        platform = sys.platform
+        
+        try:
+            if platform == "darwin":  # macOS
+                subprocess.run(["say", "-v", "Samantha", "-o", output_file, text])
+            elif platform == "win32":  # Windows
+                import win32com.client
+                speaker = win32com.client.Dispatch("SAPI.SpVoice")
+                stream = win32com.client.Dispatch("SAPI.SpFileStream")
+                stream.Open(output_file, 3)
+                speaker.AudioOutputStream = stream
+                speaker.Speak(text)
+                stream.Close()
+            elif platform == "linux":  # Linux (requires espeak)
+                subprocess.run(["espeak", "-w", output_file, text])
+            else:
+                print("Text-to-speech not supported on this platform")
+                return None
+            
+            print(f"Voiceover saved to {output_file}")
+            return output_file
+        except Exception as e:
+            print(f"Voiceover generation failed: {str(e)}")
+            return None
+
+# Main workflow
+if __name__ == "__main__":
+    # 1. Load models
+    txt2img, img2img = load_models()
+    
+    # 2. Create character
+    character = CharacterGenerator((txt2img, img2img), "a young astronaut in a space suit")
+    
+    # 3. Define video script (scene descriptions and durations)
+    script = [
+        ("floating in zero gravity looking at Earth", 5),
+        ("repairing a space station with tools", 7),
+        ("watching a meteor shower in awe", 4),
+        ("running through a Martian landscape", 6),
+        ("discovering an alien artifact", 8)
+    ]
+    
+    # 4. Create video creator
+    video_maker = VideoCreator(character, script, fps=10)
+    
+    # 5. Preview key scenes
+    print("\nPreview of key scenes:")
+    video_maker.preview_scenes()
+    
+    # 6. Generate all scenes
+    print("\nGenerating full video...")
+    for action, duration in script:
+        video_maker.generate_scene(action, duration)
+    
+    # 7. Create video file
+    video_file = video_maker.generate_video("space_adventure.mp4")
+    
+    # 8. Add voiceover
+    if video_file:
+        tts = TextToSpeech()
+        narration = "In the vast expanse of space, one astronaut discovers wonders beyond imagination."
+        audio_file = tts.speak(narration)
+        
+        if audio_file:
+            # Combine video and audio (requires ffmpeg)
+            try:
+                final_output = "final_video.mp4"
+                cmd = [
+                    "ffmpeg", "-y",
+                    "-i", video_file,
+                    "-i", audio_file,
+                    "-c:v", "copy",
+                    "-c:a", "aac",
+                    "-strict", "experimental",
+                    final_output
+                ]
+                subprocess.run(cmd, check=True)
+                print(f"Final video with audio: {final_output}")
+            except Exception as e:
+                print(f"Audio combination failed: {str(e)}")
+
+    print("\nProcess complete! Note: For longer videos, consider using a GPU.")
